@@ -2,7 +2,8 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { getStats, getRecentEvents, getApiKeys, type Stats, type RecentEvent, type ApiKey } from '@/lib/api'
+import { getStats, getRecentEvents, getApiKeys, getSessionScores,
+         type Stats, type RecentEvent, type ApiKey, type SessionScores, type ScoreEntry } from '@/lib/api'
 import AppShell from '@/components/AppShell'
 
 const glass = {
@@ -102,6 +103,149 @@ function DonutChart({ events }: { events: RecentEvent[] }) {
   )
 }
 
+// ── Score detail modal ────────────────────────────────────────────────────────
+
+const ACTION_COLOR: Record<string, string> = {
+  allow:     '#61dca3',
+  challenge: '#fbbf24',
+  block:     '#f87171',
+}
+
+function ScoreBar({ label, value, max = 1 }: { label: string; value: number | null; max?: number }) {
+  if (value === null || value === undefined) return null
+  const pct = Math.round((value / max) * 100)
+  const color = value > 0.65 ? '#f87171' : value > 0.4 ? '#fbbf24' : '#61dca3'
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+        <span style={{ color: 'rgba(255,255,255,0.5)' }}>{label}</span>
+        <span style={{ color, fontWeight: 600, fontFamily: 'monospace' }}>{value.toFixed(3)}</span>
+      </div>
+      <div style={{ height: 4, background: 'rgba(255,255,255,0.08)', borderRadius: 2 }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: color, borderRadius: 2, transition: 'width 0.3s' }} />
+      </div>
+    </div>
+  )
+}
+
+function ScoreModal({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+  const [data, setData] = useState<SessionScores | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    getSessionScores(sessionId).then(setData).finally(() => setLoading(false))
+  }, [sessionId])
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 1000,
+        background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        padding: 24,
+      }}
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        style={{
+          background: 'rgba(12,12,16,0.97)', border: '1px solid rgba(255,255,255,0.1)',
+          borderRadius: 16, padding: '28px 32px', width: '100%', maxWidth: 640,
+          maxHeight: '80vh', overflowY: 'auto',
+          boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>Анализ сессии</div>
+            <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.35)', fontFamily: 'monospace', marginTop: 4 }}>
+              {sessionId}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            style={{
+              background: 'none', border: '1px solid rgba(255,255,255,0.12)',
+              borderRadius: 8, color: 'rgba(255,255,255,0.5)', cursor: 'pointer',
+              padding: '6px 12px', fontSize: 13,
+            }}
+          >
+            закрыть
+          </button>
+        </div>
+
+        {loading && (
+          <div style={{ textAlign: 'center', padding: 40, color: 'rgba(255,255,255,0.3)' }}>загрузка…</div>
+        )}
+
+        {!loading && (!data || data.scores.length === 0) && (
+          <div style={{ textAlign: 'center', padding: 40, color: 'rgba(255,255,255,0.3)' }}>
+            Нет данных скоринга для этой сессии
+          </div>
+        )}
+
+        {data?.scores.map((s, i) => (
+          <div key={s.id} style={{
+            marginBottom: 20, padding: '18px 20px',
+            background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+            borderRadius: 12,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+              <span style={{
+                background: `${ACTION_COLOR[s.action] ?? '#6B7A99'}22`,
+                color: ACTION_COLOR[s.action] ?? '#6B7A99',
+                padding: '3px 10px', borderRadius: 6,
+                fontWeight: 700, fontSize: 11, letterSpacing: '0.06em',
+              }}>
+                {s.action.toUpperCase()}
+              </span>
+              {s.event_type && (
+                <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.4)' }}>{s.event_type}</span>
+              )}
+              <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.25)', marginLeft: 'auto' }}>
+                {new Date(s.timestamp).toLocaleTimeString('ru-RU')}
+              </span>
+            </div>
+
+            <div style={{ marginBottom: 16 }}>
+              <ScoreBar label="Итоговый score"  value={s.score} />
+              <ScoreBar label="L1 — поведение"  value={s.l1} />
+              <ScoreBar label="L2 — сеть/устройство" value={s.l2} />
+              <ScoreBar label="L3 — паттерны"   value={s.l3} />
+              <ScoreBar label="Embedding drift"  value={s.embedding} />
+            </div>
+
+            {s.reasons.length > 0 && (
+              <div>
+                <div style={{ fontSize: 11, fontWeight: 600, color: 'rgba(255,255,255,0.35)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                  Причины
+                </div>
+                {s.reasons.map((r, j) => (
+                  <div key={j} style={{
+                    fontSize: 12, color: 'rgba(255,255,255,0.7)',
+                    padding: '5px 10px', marginBottom: 4,
+                    background: 'rgba(248,113,113,0.06)',
+                    border: '1px solid rgba(248,113,113,0.15)',
+                    borderRadius: 6, lineHeight: 1.5,
+                  }}>
+                    {r}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {s.reasons.length === 0 && (
+              <div style={{ fontSize: 12, color: 'rgba(255,255,255,0.25)', fontStyle: 'italic' }}>
+                Подозрительных паттернов не обнаружено
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function StatCard({ label, value, accent, description }: { label: string; value: number | string; accent?: string; description?: string }) {
   const [tip, setTip] = useState(false)
   return (
@@ -146,15 +290,24 @@ const TYPE_COLOR: Record<string, string> = {
   page_view: '#6B7A99', click: '#a78bfa', purchase: '#61dca3', page_hide: '#6B7A99',
 }
 
-function EventRow({ ev }: { ev: RecentEvent }) {
+function EventRow({ ev, onClick }: { ev: RecentEvent; onClick: () => void }) {
+  const [hovered, setHovered] = useState(false)
   const color = TYPE_COLOR[ev.event_type] ?? '#fbbf24'
   const time  = new Date(ev.timestamp).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   return (
-    <div style={{
-      display: 'grid', gridTemplateColumns: '140px 1fr 120px 90px',
-      padding: '12px 20px', borderBottom: '1px solid rgba(255,255,255,0.05)',
-      fontSize: 13, alignItems: 'center', gap: 16,
-    }}>
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        display: 'grid', gridTemplateColumns: '140px 1fr 120px 90px 24px',
+        padding: '12px 20px', borderBottom: '1px solid rgba(255,255,255,0.05)',
+        fontSize: 13, alignItems: 'center', gap: 16,
+        cursor: 'pointer',
+        background: hovered ? 'rgba(255,255,255,0.03)' : 'transparent',
+        transition: 'background 0.12s',
+      }}
+    >
       <span style={{
         background: `${color}22`, color, padding: '3px 10px',
         borderRadius: 6, fontWeight: 600, fontSize: 11, textAlign: 'center', letterSpacing: '0.04em',
@@ -164,8 +317,9 @@ function EventRow({ ev }: { ev: RecentEvent }) {
       <span style={{ color: 'rgba(255,255,255,0.35)', fontFamily: 'monospace', fontSize: 11 }}>
         {ev.session_id.slice(0, 18)}…
       </span>
-      <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 12 }}>{ev.ip ?? '—'}</span>
+      <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 12 }}>{ev.ip || '—'}</span>
       <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: 12, textAlign: 'right' }}>{time}</span>
+      <span style={{ color: 'rgba(255,255,255,0.2)', fontSize: 14 }}>›</span>
     </div>
   )
 }
@@ -237,11 +391,12 @@ function useRealtimeDashboard(
 
 export default function Dashboard() {
   const router = useRouter()
-  const [stats,   setStats]   = useState<Stats | null>(null)
-  const [events,  setEvents]  = useState<RecentEvent[]>([])
-  const [keys,    setKeys]    = useState<ApiKey[]>([])
-  const [error,   setError]   = useState('')
-  const [online,  setOnline]  = useState(false)
+  const [stats,           setStats]           = useState<Stats | null>(null)
+  const [events,          setEvents]          = useState<RecentEvent[]>([])
+  const [keys,            setKeys]            = useState<ApiKey[]>([])
+  const [error,           setError]           = useState('')
+  const [online,          setOnline]          = useState(false)
+  const [selectedSession, setSelectedSession] = useState<string | null>(null)
 
   useEffect(() => {
     if (!localStorage.getItem('mdr_token')) { router.push('/auth/login'); return }
@@ -335,11 +490,12 @@ export default function Dashboard() {
       <div style={{ ...glass, overflow: 'hidden' }}>
         <div style={{
           padding: '14px 20px', borderBottom: '1px solid rgba(255,255,255,0.06)',
-          display: 'grid', gridTemplateColumns: '140px 1fr 120px 90px',
+          display: 'grid', gridTemplateColumns: '140px 1fr 120px 90px 24px',
           gap: 16, fontSize: 10, fontWeight: 700,
           color: 'rgba(255,255,255,0.3)', textTransform: 'uppercase', letterSpacing: '0.08em',
         }}>
-          <span>Событие</span><span>Сессия</span><span>IP</span><span style={{ textAlign: 'right' }}>Время</span>
+          <span>Событие</span><span>Сессия</span><span>IP</span>
+          <span style={{ textAlign: 'right' }}>Время</span><span />
         </div>
         {events.length === 0 ? (
           <div style={{ padding: '48px 32px', textAlign: 'center' }}>
@@ -350,9 +506,22 @@ export default function Dashboard() {
             </div>
           </div>
         ) : (
-          events.map(ev => <EventRow key={ev.id} ev={ev} />)
+          events.map(ev => (
+            <EventRow
+              key={ev.id}
+              ev={ev}
+              onClick={() => setSelectedSession(ev.session_id)}
+            />
+          ))
         )}
       </div>
+
+      {selectedSession && (
+        <ScoreModal
+          sessionId={selectedSession}
+          onClose={() => setSelectedSession(null)}
+        />
+      )}
     </AppShell>
   )
 }

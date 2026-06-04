@@ -11,6 +11,7 @@ use crate::fraud::{
     embedding::BehaviorEmbedding,
     features::{EventFeatures, SessionAccumulator, humanity_score},
     graph::BehaviorGraph,
+    meta_variance::MetaVarianceTracker,
 };
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
@@ -27,29 +28,32 @@ struct HotEntry {
     recent_events:    VecDeque<String>,
     session_sequence: Vec<String>,
     continuity:       ContinuitySignature,
+    meta_var:         MetaVarianceTracker,
 }
 
 struct EntrySnapshot {
-    graph:           Arc<RwLock<BehaviorGraph>>,
-    dirty:           Arc<AtomicBool>,
-    recent_snap:     Vec<String>,
-    session_seq:     Vec<String>,
-    embedding_score: f32,
+    graph:            Arc<RwLock<BehaviorGraph>>,
+    dirty:            Arc<AtomicBool>,
+    recent_snap:      Vec<String>,
+    session_seq:      Vec<String>,
+    embedding_score:  f32,
     continuity_score: f32,
-    completed_seq:   Option<Vec<String>>,  // Some(_) только на page_hide
-    humanity_score:  f32,
+    completed_seq:    Option<Vec<String>>,  // Some(_) только на page_hide
+    humanity_score:   f32,
+    meta_var_anomaly: f32,
 }
 
 pub struct L1Result {
-    pub l1_score:        f32,
-    pub path_score:      f32,
-    pub familiarity:     f32,
-    pub session_seq:     Vec<String>,
-    pub reasons:         Vec<String>,
-    pub embedding_score: f32,
+    pub l1_score:         f32,
+    pub path_score:       f32,
+    pub familiarity:      f32,
+    pub session_seq:      Vec<String>,
+    pub reasons:          Vec<String>,
+    pub embedding_score:  f32,
     pub continuity_score: f32,
-    pub completed_seq:   Option<Vec<String>>,
-    pub humanity_score:  f32,
+    pub completed_seq:    Option<Vec<String>>,
+    pub humanity_score:   f32,
+    pub meta_var_anomaly: f32,
 }
 
 pub struct L1Store {
@@ -124,6 +128,7 @@ impl L1Store {
                 recent_events:    VecDeque::with_capacity(RECENT_WINDOW + 1),
                 session_sequence: Vec::new(),
                 continuity:       ContinuitySignature::default(),
+                meta_var:         MetaVarianceTracker::default(),
             }
         });
 
@@ -157,6 +162,11 @@ impl L1Store {
             0.2
         };
 
+        // Meta-variance: compare current session's deviation-stability against user's history
+        let meta_var_anomaly = entry.meta_var.meta_variance()
+            .map(|mv| entry.embedding.read().meta_variance_anomaly(mv))
+            .unwrap_or(0.0);
+
         // Session finalization on page_hide
         let (completed_seq, humanity_score_val) = if ef.event_type == "page_hide"
             && entry.session_events.len() >= 5
@@ -167,6 +177,12 @@ impl L1Store {
             // Humanity score from raw events
             let evs: Vec<EventFeatures> = entry.session_events.iter().map(|(e, _)| e.clone()).collect();
             let h = humanity_score(&evs);
+
+            // Persist meta-variance of this session into the embedding
+            if let Some(mv) = entry.meta_var.meta_variance() {
+                entry.embedding.write().update_meta_variance(mv);
+            }
+            entry.meta_var.reset();
 
             // Stage 2: filter events before training the embedding
             // Remove: same-type duplicates <80ms, accidental scroll/page_view <1s
@@ -197,7 +213,8 @@ impl L1Store {
             embedding_score,
             continuity_score,
             completed_seq,
-            humanity_score: humanity_score_val,
+            humanity_score:   humanity_score_val,
+            meta_var_anomaly,
         }
     }
 
@@ -211,8 +228,8 @@ impl L1Store {
         let snap = self.access_entry(user_id, ef);
 
         let l1_score = if let Some(prev) = prev_event {
-            let s = snap.graph.read().score_transition(prev, &ef.event_type, ef.pause_ms);
-            snap.graph.write().observe(prev, &ef.event_type, ef.pause_ms);
+            let s = snap.graph.read().score_transition(prev, ef);
+            snap.graph.write().observe(prev, ef);
             snap.dirty.store(true, Ordering::Relaxed);
             if s > 0.6 {
                 reasons.push(format!(
@@ -223,6 +240,11 @@ impl L1Store {
         } else {
             0.0
         };
+
+        // Feed l1_score into the meta-variance tracker for next event's snapshot
+        if let Some(mut entry) = self.graphs.get_mut(&user_id) {
+            entry.meta_var.push(l1_score);
+        }
 
         let recent_refs: Vec<&str> = snap.recent_snap.iter().map(|s| s.as_str()).collect();
         let path_score  = snap.graph.read().path_optimality_score(&recent_refs);
@@ -237,6 +259,9 @@ impl L1Store {
         if snap.continuity_score > 0.4 {
             reasons.push(format!("continuity break (possible session handoff): {:.2}", snap.continuity_score));
         }
+        if snap.meta_var_anomaly > 0.5 {
+            reasons.push(format!("meta-variance anomaly (noise pattern mismatch): {:.2}", snap.meta_var_anomaly));
+        }
 
         L1Result {
             l1_score,
@@ -247,6 +272,7 @@ impl L1Store {
             session_seq:      snap.session_seq,
             completed_seq:    snap.completed_seq,
             humanity_score:   snap.humanity_score,
+            meta_var_anomaly: snap.meta_var_anomaly,
             reasons,
         }
     }

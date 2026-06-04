@@ -130,3 +130,26 @@ export interface RecentEvent {
 export async function getRecentEvents(): Promise<RecentEvent[]> {
   return request('/api/events/recent')
 }
+
+// ── session scores (click-to-inspect) ─────────────────────────
+export interface ScoreEntry {
+  id:         string
+  event_type: string | null
+  score:      number
+  l1:         number | null
+  l2:         number | null
+  l3:         number | null
+  embedding:  number | null
+  action:     string
+  reasons:    string[]
+  timestamp:  string
+}
+
+export interface SessionScores {
+  session_id: string
+  scores:     ScoreEntry[]
+}
+
+export async function getSessionScores(sessionId: string): Promise<SessionScores> {
+  return request(`/api/events/scores/${sessionId}`)
+}

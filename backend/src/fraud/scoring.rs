@@ -37,24 +37,62 @@ pub struct FraudScore {
 }
 
 pub struct FraudEngineInner {
-    pub l1:  L1Store,
-    pub geo: GeoIp,
-    pub db:  PgPool,
+    pub l1:           L1Store,
+    pub geo:          GeoIp,
+    pub db:           PgPool,
+    // fingerprint ↔ graph-key registry (sled trees, survive restarts)
+    fp_by_subject:    sled::Tree,  // graph_key_bytes → fingerprint_bytes
+    subject_by_fp:    sled::Tree,  // fingerprint_bytes → graph_key_bytes (last seen)
 }
 
 pub type FraudEngine = Arc<FraudEngineInner>;
 
 impl FraudEngineInner {
     pub fn new(db: PgPool, graphs_path: &str) -> anyhow::Result<Arc<Self>> {
-        let l1 = L1Store::open(graphs_path)?;
-        let vpn_tree = l1.open_tree("vpn_ips")?;
-        Ok(Arc::new(Self { geo: GeoIp::new(vpn_tree), l1, db }))
+        let l1           = L1Store::open(graphs_path)?;
+        let vpn_tree     = l1.open_tree("vpn_ips")?;
+        let fp_by_subject = l1.open_tree("fp_by_subject")?;
+        let subject_by_fp = l1.open_tree("subject_by_fp")?;
+        Ok(Arc::new(Self {
+            geo: GeoIp::new(vpn_tree),
+            l1,
+            db,
+            fp_by_subject,
+            subject_by_fp,
+        }))
     }
 
+    /// Check fingerprint consistency for a known graph subject.
+    /// Returns (device_mismatch_risk, fp_collision_risk).
+    fn check_fingerprint(&self, graph_key: Uuid, fingerprint: &str) -> (f32, f32) {
+        let key_bytes = graph_key.as_bytes().as_slice();
+        let fp_bytes  = fingerprint.as_bytes();
+
+        let device_mismatch = self.fp_by_subject.get(key_bytes)
+            .ok()
+            .flatten()
+            .map(|stored| if stored.as_ref() != fp_bytes { 0.65 } else { 0.0 })
+            .unwrap_or(0.0);
+
+        // fingerprint seen for a DIFFERENT subject = shared device or collision
+        let fp_collision = self.subject_by_fp.get(fp_bytes)
+            .ok()
+            .flatten()
+            .map(|stored_key| if stored_key.as_ref() != key_bytes { 0.55 } else { 0.0 })
+            .unwrap_or(0.0);
+
+        let _ = self.fp_by_subject.insert(key_bytes, fp_bytes);
+        let _ = self.subject_by_fp.insert(fp_bytes, key_bytes);
+
+        (device_mismatch, fp_collision)
+    }
+
+    /// graph_key — pre-namespaced composite (tenant_id ⊗ subject_id).
+    /// None when the event has no identity at all → L1 is skipped.
     pub async fn score_event(
         &self,
         session_id:  &str,
-        user_id:     Option<Uuid>,
+        graph_key:   Option<Uuid>,
         event_type:  &str,
         payload:     &serde_json::Value,
         ip:          Option<&str>,
@@ -81,19 +119,32 @@ impl FraudEngineInner {
 
         let ef = EventFeatures::from_payload(event_type, payload);
 
+        // Fingerprint consistency: device-mismatch and cross-subject collision
+        let (fp_device_mismatch, fp_collision) = match (graph_key, fingerprint) {
+            (Some(key), Some(fp)) => self.check_fingerprint(key, fp),
+            _ => (0.0, 0.0),
+        };
+        if fp_device_mismatch > 0.0 {
+            reasons.push(format!("device mismatch (fingerprint changed): {:.2}", fp_device_mismatch));
+        }
+        if fp_collision > 0.0 {
+            reasons.push(format!("fingerprint seen with different account: {:.2}", fp_collision));
+        }
+
         // L2 runs async before acquiring any graph lock
         let l2_score = l2::score(
             &self.db, &self.geo,
             ip, visitor_id, user_agent,
-            webrtc_ip, ipv6, timezone, fingerprint,
+            webrtc_ip, ipv6, timezone,
+            fp_device_mismatch, fp_collision,
         ).await;
         if l2_score > 0.5 {
             reasons.push(format!("L2 network anomaly: {:.2}", l2_score));
         }
 
         let (l1_score, path_score, familiarity, l3_score, embedding_s,
-             continuity_s, completed_seq, humanity_score) = match user_id {
-            None => (0.1, 0.0, 0.0, 0.0, 0.2, 0.0, None, 0.5),
+             continuity_s, meta_var_s, completed_seq, humanity_score) = match graph_key {
+            None => (0.1, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0, None, 0.5),
             Some(uid) => {
                 let r = self.l1.score(uid, prev_event, &ef);
                 reasons.extend(r.reasons);
@@ -113,7 +164,7 @@ impl FraudEngineInner {
                 }
 
                 (r.l1_score, r.path_score, r.familiarity, l3_s,
-                 r.embedding_score, r.continuity_score,
+                 r.embedding_score, r.continuity_score, r.meta_var_anomaly,
                  r.completed_seq, r.humanity_score)
             }
         };
@@ -125,17 +176,19 @@ impl FraudEngineInner {
             reasons.push(format!("embedding anomaly: {:.2}", embedding_s));
         }
 
-        let s_rate = (l1_score    * 0.32
-                    + l2_score    * 0.23
-                    + embedding_s * 0.18
-                    + combined_ho * 0.15
-                    + continuity_s * 0.07
-                    + l3_score    * 0.05).clamp(0.0, 1.0);
+        // weights sum to 1.0: meta_var gets 0.04 carved from l1 and continuity
+        let s_rate = (l1_score     * 0.30
+                    + l2_score     * 0.23
+                    + embedding_s  * 0.18
+                    + combined_ho  * 0.15
+                    + continuity_s * 0.05
+                    + meta_var_s   * 0.04
+                    + l3_score     * 0.05).clamp(0.0, 1.0);
 
         let score = conditional_anomaly(s_rate, event_global_risk(event_type), familiarity, 0.4);
 
         // Adaptive threshold: tighter for predictable users, looser for variable ones
-        let block_thresh = match user_id {
+        let block_thresh = match graph_key {
             Some(uid) => self.l1.get_adaptive_threshold(uid),
             None      => 0.75,
         };

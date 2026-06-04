@@ -1,37 +1,40 @@
 use sqlx::PgPool;
 use crate::fraud::geoip::{GeoIp, NetworkType};
 
+/// fp_device_mismatch: same subject, fingerprint changed (pre-computed by FraudEngine).
+/// fp_collision: this fingerprint was last seen on a different subject.
 pub async fn score(
-    db:          &PgPool,
-    geo:         &GeoIp,
-    ip:          Option<&str>,
-    visitor_id:  Option<&str>,
-    user_agent:  Option<&str>,
-    webrtc_ip:   Option<&str>,
-    ipv6:        Option<&str>,
-    timezone:    Option<&str>,
-    fingerprint: Option<&str>,
+    db:                &PgPool,
+    geo:               &GeoIp,
+    ip:                Option<&str>,
+    visitor_id:        Option<&str>,
+    user_agent:        Option<&str>,
+    webrtc_ip:         Option<&str>,
+    ipv6:              Option<&str>,
+    timezone:          Option<&str>,
+    fp_device_mismatch: f32,
+    fp_collision:       f32,
 ) -> f32 {
-    // WebRTC mismatch is the primary VPN signal. When confirmed, persist the
-    // exit-node IP so future requests skip the IPinfo round-trip.
-    let webrtc = webrtc_mismatch_risk(geo, ip, webrtc_ip, ipv6);
-
+    let webrtc      = webrtc_mismatch_risk(geo, ip, webrtc_ip, ipv6);
     let asn_risk    = asn_risk(geo, ip).await;
     let tz_risk     = timezone_country_mismatch(geo, ip, timezone).await;
     let shared_ip   = shared_ip_risk(db, ip).await;
     let ua_risk     = user_agent_risk(user_agent);
-    let fingerprint = fingerprint_collision_risk(db, fingerprint).await;
     let temporal    = temporal_pattern_risk(db, ip).await;
     let ip_rotation = visitor_ip_rotation_risk(db, visitor_id).await;
 
+    // fingerprint signals come pre-computed from FraudEngine's sled registry
+    let fp_signal = fp_device_mismatch.max(fp_collision);
+
     (webrtc      * 0.25
    + asn_risk    * 0.20
-   + shared_ip   * 0.15
-   + fingerprint * 0.15
+   + shared_ip   * 0.13
+   + fp_signal   * 0.15
    + ip_rotation * 0.10
    + tz_risk     * 0.08
    + temporal    * 0.05
-   + ua_risk     * 0.02)
+   + ua_risk     * 0.02
+   + fp_collision * 0.02)  // extra weight when account collision confirmed
     .clamp(0.0, 1.0)
 }
 
@@ -120,27 +123,6 @@ async fn visitor_ip_rotation_risk(db: &PgPool, visitor_id: Option<&str>) -> f32 
     }
 }
 
-async fn fingerprint_collision_risk(db: &PgPool, fingerprint: Option<&str>) -> f32 {
-    let Some(fp) = fingerprint else { return 0.0 };
-
-    let collisions: i64 = sqlx::query_scalar!(
-        r#"SELECT COUNT(DISTINCT visitor_id) as "c!"
-           FROM events
-           WHERE payload->>'fingerprint_id' = $1
-             AND timestamp > NOW() - INTERVAL '7 days'"#,
-        fp
-    )
-    .fetch_one(db)
-    .await
-    .unwrap_or(0);
-
-    match collisions {
-        0..=2   => 0.0,
-        3..=10  => 0.30,
-        11..=30 => 0.65,
-        _       => 0.90,
-    }
-}
 
 async fn temporal_pattern_risk(db: &PgPool, ip: Option<&str>) -> f32 {
     let Some(ip) = ip else { return 0.0 };

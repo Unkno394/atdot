@@ -1,5 +1,6 @@
 use axum::{routing::{delete, get, post}, Router};
 use sqlx::postgres::PgPoolOptions;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
@@ -61,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/ingest/batch",   post(api::events::ingest_batch))
         .route("/api/stats",          get(api::events::stats))
         .route("/api/events/recent",  get(api::events::recent))
+        .route("/api/events/scores/:session_id", get(api::events::session_scores))
         .route("/api/feedback",        post(api::feedback::submit))
         .route("/api/challenge/verify", post(api::challenge::verify))
         // websocket
@@ -74,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
     tracing::info!("madrigal backend listening on :{port}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

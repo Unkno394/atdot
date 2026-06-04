@@ -1,3 +1,4 @@
+
 # ATdot — поведенческий антифрод
 
 ![Rust](https://img.shields.io/badge/backend-Rust-orange?logo=rust)
@@ -283,3 +284,93 @@ RAM (`DashMap`):
 | WebSocket | axum ws | Real-time обновления дашборда без polling |
 | Dashboard | Next.js 15, React 19 | Server components, App Router |
 | SDK | Vanilla JS IIFE | Нет зависимостей, ~8kb, async/non-blocking |
+
+---
+
+## API: ключевые эндпоинты
+
+### Инgest (SDK → бэкенд)
+
+```
+POST /api/ingest/batch
+X-API-Key: mdr_<key>
+
+{ "events": [ { session_id, visitor_id, event_type, payload, user_id?, fingerprint?, ... } ] }
+```
+
+Ответ содержит `action` и опционально `challenge` для каждого события.
+
+### Дашборд (аутентифицированные)
+
+| Метод | Путь | Описание |
+|---|---|---|
+| `GET` | `/api/events/recent` | Последние 50 событий |
+| `GET` | `/api/events/scores/:session_id` | Скоринг-детали сессии (L1/L2/L3, reasons) |
+| `GET` | `/api/stats` | DAU, события, фрод-алерты |
+| `POST` | `/api/feedback` | Подтвердить фрод / снять ложную тревогу |
+
+### Debug (только локально, без auth)
+
+```
+GET /debug/stats
+```
+
+Возвращает последние 50 записей `session_scores` с полным разбором: L1/L2/L3/embedding, action, reasons, временная метка.
+
+---
+
+## Иерархия идентификации
+
+```
+API-ключ → tenant_id (мерчант)
+                │
+    ┌───────────┴──────────────┐
+    │                          │
+user_id присутствует      только visitor_id
+(atdot.identify() вызван)  (анонимный посетитель)
+    │                          │
+граф (tenant_id ⊗ user_id)  граф (tenant_id ⊗ visitor_id)
+— сильный, не привязан       — слабее, привязан к cookie
+  к конкретному браузеру
+    │
+fingerprint → только L2-сигнал:
+  • изменился при том же user_id  → device mismatch (L2 +0.65)
+  • виден у другого user_id       → collision (L2 +0.55)
+```
+
+Аккаунт первичен. Устройство — вторично. Fingerprint никогда не является ключом графа — только сигналом.
+
+---
+
+## Когнитивный профиль рёбер графа
+
+Каждое ребро A→B хранит не просто паузу, а **когнитивный профиль** перехода:
+
+| Поле | Что измеряет |
+|---|---|
+| `pause_stats` | Сколько думает пользователь между событиями |
+| `linearity_stats` | Насколько прямая траектория мыши при этом переходе |
+| `hover_stats` | Сколько нависает над элементом перед кликом |
+| `micro_stats` | Частота микрокоррекций (показатель неуверенности) |
+| `velocity_stats` | S-кривая замедления у цели |
+| `fitts_stats` | Моторная сложность цели |
+
+При скоринге: если текущий профиль отклоняется от накопленного (z-score > 1σ по 5+ наблюдениям) — сигнал.
+
+**Meta-variance** — дисперсия дисперсий: насколько нестабильна сама нестабильность поведения. У человека есть характерная "амплитуда шума", у бота — либо нулевая (скриптовая стабильность) либо чисто случайная.
+
+---
+
+## Запуск
+
+```bash
+# бэкенд
+cd backend
+cp .env.example .env  # DATABASE_URL, JWT_SECRET, PORT=8080
+cargo run
+
+# дашборд
+cd atdot
+npm install
+npm run dev
+```

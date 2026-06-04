@@ -1,6 +1,7 @@
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::{ConnectInfo, Path, State}, http::HeaderMap, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -46,12 +47,41 @@ pub struct RecentEvent {
     pub ip:         Option<String>,
 }
 
-/// Parse the SDK's user_id string into a UUID for L1 graph keying.
-/// Valid UUID strings are used as-is; anything else is hashed via UUID v5
-/// (deterministic — same input always produces the same UUID).
+/// Parse the SDK's user_id string into a UUID.
+/// Valid UUID strings are used as-is; anything else is hashed via UUID v5.
 fn resolve_user_id(s: &str) -> Uuid {
     Uuid::parse_str(s)
         .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_DNS, s.as_bytes()))
+}
+
+/// Build a namespace-scoped graph key: (tenant_id ⊗ subject_id) via UUID v5.
+/// Ensures that the same end-user on two different tenants gets independent graphs.
+fn namespace_graph_key(tenant_id: Uuid, subject_id: Uuid) -> Uuid {
+    Uuid::new_v5(&tenant_id, subject_id.as_bytes())
+}
+
+/// Resolve the L1 graph key using the correct identity hierarchy:
+///   1. Authenticated end-user (user_id) — strong, survives browser changes
+///   2. Anonymous visitor (visitor_id)   — weaker, local to this device/cookie
+///   3. None                             — no identity, L1 is skipped
+///
+/// tenant_id namespaces the graph so the same end-user on two sites stays separate.
+fn resolve_graph_key(
+    tenant_id:  Option<Uuid>,
+    user_id:    Option<&str>,
+    visitor_id: Option<&str>,
+) -> Option<Uuid> {
+    let tenant = tenant_id?;
+    match (user_id, visitor_id) {
+        (Some(uid), _) => {
+            Some(namespace_graph_key(tenant, resolve_user_id(uid)))
+        }
+        (None, Some(vid)) => {
+            let vid_uuid = Uuid::new_v5(&Uuid::NAMESPACE_DNS, vid.as_bytes());
+            Some(namespace_graph_key(tenant, vid_uuid))
+        }
+        (None, None) => None,
+    }
 }
 
 /// Core per-event processing: score, persist, optionally create challenge.
@@ -62,17 +92,19 @@ async fn process_event(
     key_id:     Uuid,
     ip:         Option<&str>,
     ua:         Option<&str>,
-    owner_uid:  Option<Uuid>,
+    tenant_id:  Option<Uuid>,   // merchant who owns this API key
     prev_event: Option<&str>,
 ) -> serde_json::Value {
-    // Prefer the SDK-supplied end-user ID; fall back to the merchant's owner UUID
-    let effective_uid = req.user_id.as_deref()
-        .map(resolve_user_id)
-        .or(owner_uid);
+    // Account is primary, device is secondary — never fall back to the merchant's own identity
+    let graph_key = resolve_graph_key(
+        tenant_id,
+        req.user_id.as_deref(),
+        req.visitor_id.as_deref(),
+    );
 
     let fraud_score = state.fraud.score_event(
         &req.session_id,
-        effective_uid,
+        graph_key,
         &req.event_type,
         &req.payload.clone().unwrap_or_default(),
         ip,
@@ -172,10 +204,11 @@ async fn process_event(
 
 pub async fn ingest(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<IngestRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (key_id, ip, ua, owner_uid) = auth_and_extract(&state, &headers).await?;
+    let (key_id, ip, ua, tenant_id) = auth_and_extract(&state, &headers, Some(peer)).await?;
 
     sqlx::query!(
         r#"INSERT INTO events (api_key_id, session_id, visitor_id, event_type, payload, ip, user_agent)
@@ -196,7 +229,7 @@ pub async fn ingest(
     let resp = process_event(
         &state, &req, key_id,
         ip.as_deref(), ua.as_deref(),
-        owner_uid, prev_event.as_deref(),
+        tenant_id, prev_event.as_deref(),
     ).await;
 
     Ok(Json(resp))
@@ -206,6 +239,7 @@ pub async fn ingest(
 /// Events are processed in order; each gets its own score/action response.
 pub async fn ingest_batch(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(batch): Json<BatchRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -213,7 +247,7 @@ pub async fn ingest_batch(
         return Ok(Json(serde_json::json!({ "ok": true, "responses": [] })));
     }
 
-    let (key_id, ip, ua, owner_uid) = auth_and_extract(&state, &headers).await?;
+    let (key_id, ip, ua, tenant_id) = auth_and_extract(&state, &headers, Some(peer)).await?;
 
     // Insert all events into the events table
     for req in &batch.events {
@@ -242,7 +276,7 @@ pub async fn ingest_batch(
         let resp = process_event(
             &state, req, key_id,
             ip.as_deref(), ua.as_deref(),
-            owner_uid, prev_event.as_deref(),
+            tenant_id, prev_event.as_deref(),
         ).await;
         prev_event = Some(req.event_type.clone());
         responses.push(resp);
@@ -254,8 +288,9 @@ pub async fn ingest_batch(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 async fn auth_and_extract(
-    state:   &AppState,
-    headers: &HeaderMap,
+    state:    &AppState,
+    headers:  &HeaderMap,
+    peer:     Option<SocketAddr>,
 ) -> Result<(Uuid, Option<String>, Option<String>, Option<Uuid>), AppError> {
     let api_key = headers
         .get("X-API-Key")
@@ -267,24 +302,28 @@ async fn auth_and_extract(
         .await?
         .ok_or_else(|| AppError::Auth("invalid API key".into()))?;
 
+    // IP priority: X-Forwarded-For (reverse proxy) → X-Real-IP → direct connection
     let ip = headers
         .get("X-Forwarded-For")
+        .or_else(|| headers.get("X-Real-IP"))
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string());
+        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| peer.map(|a| a.ip().to_string()));
 
     let ua = headers
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let owner_uid = sqlx::query!("SELECT user_id FROM api_keys WHERE id = $1", key_row.id)
+    let tenant_id = sqlx::query!("SELECT user_id FROM api_keys WHERE id = $1", key_row.id)
         .fetch_optional(&state.db)
         .await
         .ok()
         .flatten()
         .map(|r| r.user_id);
 
-    Ok((key_row.id, ip, ua, owner_uid))
+    Ok((key_row.id, ip, ua, tenant_id))
 }
 
 async fn query_prev_event(state: &AppState, session_id: &str) -> Option<String> {
@@ -373,4 +412,48 @@ pub async fn recent(
         timestamp:  r.timestamp.to_rfc3339(),
         ip:         r.ip.clone(),
     }).collect()))
+}
+
+/// GET /api/events/scores/:session_id
+/// Returns all fraud scores recorded for this session (newest first).
+/// Used by the dashboard to show per-event score breakdown on click.
+pub async fn session_scores(
+    State(state): State<Arc<AppState>>,
+    auth: AuthUser,
+    Path(session_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let uid = Uuid::parse_str(&auth.user_id).unwrap();
+
+    let rows = sqlx::query(
+        r#"SELECT ss.id, ss.event_type, ss.score, ss.l1_score, ss.l2_score,
+                  ss.l3_score, ss.embedding_score, ss.action, ss.reasons, ss.created_at
+           FROM session_scores ss
+           JOIN api_keys k ON ss.api_key_id = k.id
+           WHERE ss.session_id = $1 AND k.user_id = $2
+           ORDER BY ss.created_at DESC
+           LIMIT 30"#,
+    )
+    .bind(&session_id)
+    .bind(uid)
+    .fetch_all(&state.db)
+    .await?;
+
+    let scores: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({
+            "id":              r.try_get::<Uuid, _>("id").map(|u| u.to_string()).unwrap_or_default(),
+            "event_type":      r.try_get::<Option<String>, _>("event_type").unwrap_or(None),
+            "score":           r.try_get::<f64, _>("score").unwrap_or(0.0),
+            "l1":              r.try_get::<Option<f64>, _>("l1_score").unwrap_or(None),
+            "l2":              r.try_get::<Option<f64>, _>("l2_score").unwrap_or(None),
+            "l3":              r.try_get::<Option<f64>, _>("l3_score").unwrap_or(None),
+            "embedding":       r.try_get::<Option<f64>, _>("embedding_score").unwrap_or(None),
+            "action":          r.try_get::<String, _>("action").unwrap_or_default(),
+            "reasons":         r.try_get::<serde_json::Value, _>("reasons").unwrap_or(serde_json::json!([])),
+            "timestamp":       r.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                                 .map(|t| t.to_rfc3339())
+                                 .unwrap_or_default(),
+        })
+    }).collect();
+
+    Ok(Json(serde_json::json!({ "session_id": session_id, "scores": scores })))
 }

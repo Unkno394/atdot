@@ -50,18 +50,28 @@ pub struct BehaviorEmbedding {
     /// Each confirmed-fraud label tightens the adaptive block threshold by 0.04.
     #[serde(default)]
     pub fraud_strikes: u8,
+    // meta-variance tracking: Welford over per-session variance-of-deviations
+    #[serde(default)]
+    pub meta_var_mu:    f32,
+    #[serde(default)]
+    pub meta_var_m2:    f32,
+    #[serde(default)]
+    pub meta_var_eff_n: f32,
 }
 
 impl BehaviorEmbedding {
     pub fn new(user_id: Uuid) -> Self {
         Self {
             user_id,
-            mu:            [0.0; DIM],
-            sigma2:        [0.0; DIM],
-            m2:            [0.0; DIM],
-            session_count: 0,
-            eff_n:         0.0,
-            fraud_strikes: 0,
+            mu:             [0.0; DIM],
+            sigma2:         [0.0; DIM],
+            m2:             [0.0; DIM],
+            session_count:  0,
+            eff_n:          0.0,
+            fraud_strikes:  0,
+            meta_var_mu:    0.0,
+            meta_var_m2:    0.0,
+            meta_var_eff_n: 0.0,
         }
     }
 
@@ -122,5 +132,31 @@ impl BehaviorEmbedding {
         if self.fraud_strikes < 10 {
             self.fraud_strikes += 1;
         }
+    }
+
+    /// Update meta-variance profile with the variance-of-deviations from a completed session.
+    pub fn update_meta_variance(&mut self, session_mv: f32) {
+        self.meta_var_eff_n = self.meta_var_eff_n * DECAY + 1.0;
+        let n = self.meta_var_eff_n;
+        self.meta_var_m2 *= DECAY;
+        let delta  = session_mv - self.meta_var_mu;
+        self.meta_var_mu += delta / n;
+        let delta2 = session_mv - self.meta_var_mu;
+        self.meta_var_m2 += delta * delta2;
+    }
+
+    fn meta_var_sigma2(&self) -> f32 {
+        if self.meta_var_eff_n < 2.0 { return 0.0; }
+        (self.meta_var_m2 / (self.meta_var_eff_n - 1.0)).max(0.0)
+    }
+
+    /// How anomalous is the current session's meta-variance vs this user's history?
+    /// Returns 0.0 if not enough sessions yet, 1.0 for extreme mismatch.
+    pub fn meta_variance_anomaly(&self, current_mv: f32) -> f32 {
+        if self.meta_var_eff_n < 5.0 { return 0.0; }
+        let std = self.meta_var_sigma2().sqrt();
+        if std < 0.001 { return 0.0; }
+        let z = (current_mv - self.meta_var_mu).abs() / std;
+        (z / 3.0).min(1.0)
     }
 }

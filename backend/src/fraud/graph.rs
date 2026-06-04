@@ -2,6 +2,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
 use uuid::Uuid;
 
+use crate::fraud::features::EventFeatures;
+
 const PRUNE_AFTER_N:   u64  = 500;
 const PRUNE_MIN_COUNT: u64  = 2;
 const PRUNE_MIN_PROB:  f32  = 0.01;
@@ -32,10 +34,19 @@ impl Welford {
 }
 
 /// Directed edge: transition A → B
+///
+/// Each edge stores not just timing but a full cognitive profile:
+/// how this user moves, hesitates, and corrects when making this specific choice.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct EdgeData {
-    pub count:       u64,
-    pub pause_stats: Welford,
+    pub count:            u64,
+    pub pause_stats:      Welford,
+    // cognitive profile — populated only from click events
+    pub linearity_stats:  Welford,   // mouse_linearity: 0=chaotic, 1=perfectly straight
+    pub hover_stats:      Welford,   // hover_duration_ms / 3000, normalized
+    pub micro_stats:      Welford,   // micro_corrections / trajectory_len
+    pub velocity_stats:   Welford,   // 1 - (final_vel / max_vel): S-curve deceleration
+    pub fitts_stats:      Welford,   // fitts_id: motor complexity of the target
 }
 
 /// Hardcoded prior — используется пока L1 пустой или L3 не накопился.
@@ -226,17 +237,40 @@ impl BehaviorGraph {
         }
     }
 
-    pub fn observe(&mut self, from: &str, to: &str, pause_ms: f64) {
-        self.edges
+    pub fn observe(&mut self, from: &str, ef: &EventFeatures) {
+        let to = &ef.event_type;
+
+        let edge = self.edges
             .entry(from.to_string())
             .or_default()
-            .entry(to.to_string())
-            .or_default()
-            .count += 1;
+            .entry(to.clone())
+            .or_default();
 
-        self.edges.get_mut(from).unwrap()
-            .get_mut(to).unwrap()
-            .pause_stats.update(pause_ms);
+        edge.count += 1;
+        edge.pause_stats.update(ef.pause_ms);
+
+        // cognitive profile: only clicks carry motor features
+        if ef.event_type == "click" {
+            edge.linearity_stats.update(ef.mouse_linearity as f64);
+
+            if let Some(h) = ef.hover_duration_ms {
+                edge.hover_stats.update((h / 3000.0).min(1.0));
+            }
+            if let Some(mc) = ef.micro_corrections {
+                let rate = if ef.trajectory_len > 0 {
+                    mc as f64 / ef.trajectory_len as f64
+                } else { 0.0 };
+                edge.micro_stats.update(rate);
+            }
+            if let (Some(max_v), Some(fin_v)) = (ef.max_velocity, ef.final_velocity) {
+                if max_v > 0.001 {
+                    edge.velocity_stats.update((1.0 - (fin_v / max_v).min(1.0)) as f64);
+                }
+            }
+            if let Some(fid) = ef.fitts_id {
+                edge.fitts_stats.update(fid as f64);
+            }
+        }
 
         *self.node_out_counts.entry(from.to_string()).or_insert(0) += 1;
         self.total_transitions += 1;
@@ -268,48 +302,56 @@ impl BehaviorGraph {
         count as f32 / out as f32
     }
 
-    pub fn score_transition(&self, from: &str, to: &str, pause_ms: f64) -> f32 {
-        let out = *self.node_out_counts.get(from).unwrap_or(&0);
-    
+    pub fn score_transition(&self, from: &str, ef: &EventFeatures) -> f32 {
+        let to      = &ef.event_type;
+        let out     = *self.node_out_counts.get(from).unwrap_or(&0);
+
         // насколько доверяем личному графу: 0.0 при out=0, 1.0 при out≥20
         let personal_confidence = (out as f32 / 20.0).min(1.0);
-    
-        // personal score — только если есть хоть какие-то данные
+
         let personal_score = if out > 0 {
             let count = self.edges.get(from)
-                .and_then(|m| m.get(to))
+                .and_then(|m| m.get(to.as_str()))
                 .map(|e| e.count)
                 .unwrap_or(0);
-    
+
             let k = self.edges.get(from)
                 .map(|m| m.len() as f32)
                 .unwrap_or(1.0)
                 .max(1.0);
             let smoothed_prob = (count as f32 + 1.0) / (out as f32 + k);
             let rarity_score  = (1.0 - smoothed_prob) * personal_confidence;
-    
-            let pause_anomaly = self.edges
-                .get(from)
-                .and_then(|m| m.get(to))
-                .map(|e| {
-                    let std = e.pause_stats.std_dev();
-                    if std < 1.0 { return 0.0f32; }
-                    let z = ((pause_ms - e.pause_stats.mean) / std).abs();
-                    (z / 3.0).min(1.0) as f32
-                })
+
+            let edge = self.edges.get(from).and_then(|m| m.get(to.as_str()));
+
+            let pause_anomaly = edge.map(|e| {
+                let std = e.pause_stats.std_dev();
+                if std < 1.0 { return 0.0f32; }
+                let z = ((ef.pause_ms - e.pause_stats.mean) / std).abs();
+                (z / 3.0).min(1.0) as f32
+            }).unwrap_or(0.0);
+
+            // cognitive profile anomaly — how unusual is the motor signature for this edge?
+            let cog_anomaly = edge
+                .map(|e| cognitive_anomaly(e, ef))
                 .unwrap_or(0.0);
-    
-            (rarity_score * 0.6 + pause_anomaly * 0.4).clamp(0.0, 1.0)
+
+            // weights: if cognitive data is available, shift weight toward it
+            if cog_anomaly > 0.0 {
+                (rarity_score * 0.35 + pause_anomaly * 0.30 + cog_anomaly * 0.35).clamp(0.0, 1.0)
+            } else {
+                (rarity_score * 0.60 + pause_anomaly * 0.40).clamp(0.0, 1.0)
+            }
         } else {
             0.5 // нет личных данных — нейтральный score
         };
-    
+
         // prior score
         let prior_score = self.prior
             .as_ref()
-            .map(|p| p.score(from, to, pause_ms))
-            .unwrap_or(0.5); // нет prior — нейтральный
-    
+            .map(|p| p.score(from, to, ef.pause_ms))
+            .unwrap_or(0.5);
+
         // смешиваем: чем больше личных данных, тем меньше влияние prior
         let prior_confidence = 1.0 - personal_confidence;
         (personal_confidence * personal_score + prior_confidence * prior_score)
@@ -445,6 +487,52 @@ impl BehaviorGraph {
         let edge_count: usize = self.edges.values().map(|m| m.len()).sum();
         edge_count * 60 + self.node_out_counts.len() * 30
     }
+}
+
+/// Z-score anomaly across the cognitive dimensions of an edge.
+/// Returns 0.0 if there is not enough data yet, up to 1.0 for extreme mismatch.
+fn cognitive_anomaly(edge: &EdgeData, ef: &EventFeatures) -> f32 {
+    if ef.event_type != "click" { return 0.0; }
+
+    let mut total = 0.0f32;
+    let mut dims  = 0u32;
+
+    macro_rules! z_score {
+        ($stats:expr, $value:expr, $min_std:expr) => {{
+            if $stats.count >= 5 {
+                let std = $stats.std_dev();
+                if std > $min_std {
+                    let z = (($value - $stats.mean) / std).abs();
+                    total += (z as f32 / 3.0).min(1.0);
+                    dims  += 1;
+                }
+            }
+        }};
+    }
+
+    z_score!(edge.linearity_stats, ef.mouse_linearity as f64, 0.02);
+
+    if let Some(h) = ef.hover_duration_ms {
+        z_score!(edge.hover_stats, (h / 3000.0).min(1.0), 0.02);
+    }
+    if let Some(mc) = ef.micro_corrections {
+        let rate = if ef.trajectory_len > 0 {
+            mc as f64 / ef.trajectory_len as f64
+        } else { 0.0 };
+        z_score!(edge.micro_stats, rate, 0.01);
+    }
+    if let (Some(max_v), Some(fin_v)) = (ef.max_velocity, ef.final_velocity) {
+        if max_v > 0.001 {
+            let profile = (1.0 - (fin_v / max_v).min(1.0)) as f64;
+            z_score!(edge.velocity_stats, profile, 0.02);
+        }
+    }
+    if let Some(fid) = ef.fitts_id {
+        z_score!(edge.fitts_stats, fid as f64, 0.05);
+    }
+
+    if dims == 0 { return 0.0; }
+    (total / dims as f32).clamp(0.0, 1.0)
 }
 
 /// Min-heap entry for unconstrained Dijkstra
